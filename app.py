@@ -20,7 +20,7 @@ def get_hit_count():
 @app.route('/')
 def hello():
     count = get_hit_count()
-    return f'어서오세요! 현재 방문자 수는 {count}명입니다.\n'
+    return f'성공! 현재 방문자 수는 {count}명입니다.\n'
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=True)
