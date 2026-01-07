@@ -1,0 +1,16 @@
+services:
+  web:
+    build: .
+    # 이 줄이 "python3"가 아니라 "python app.py"가 되도록 강제합니다.
+    command: python app.py 
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/code
+    depends_on:
+      - redis
+    environment:
+      FLASK_ENV: development
+
+  redis:
+    image: redis:alpine
