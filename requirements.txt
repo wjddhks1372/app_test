@@ -1,6 +1,8 @@
 flask
+flask-socketio
+eventlet
 redis
+requests
 flask-sqlalchemy
 psycopg2-binary
 celery
-requests

@@ -2,108 +2,106 @@ import os
 import time
 import requests
 from flask import Flask, request, jsonify
-from redis import Redis
 from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit
+from celery import Celery
 from sqlalchemy.exc import OperationalError
-from celery import Celery # 추가
-
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'mysecret'
 
-# --- 기존 설정 유지 ---
+# 환경 변수 설정
 redis_host = os.environ.get('REDIS_HOST', 'redis')
 db_url = os.environ.get('DATABASE_URL', 'postgresql://user:password@db:5432/myapp')
-redis = Redis(host=redis_host, port=6379, decode_responses=True)
 
+# 서비스 초기화
+# 1. DB & Redis
 app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
-
-# --- Celery 설정 추가 ---
-# Redis를 메시지 브로커(우체국)로 사용합니다.
+# 2. Celery (비동기 일꾼용 우체국)
 celery = Celery(app.name, broker=f'redis://{redis_host}:6379/0', backend=f'redis://{redis_host}:6379/0')
+# 3. SocketIO (실시간 통신용)
+socketio = SocketIO(app, message_queue=f'redis://{redis_host}:6379/0', cors_allowed_origins="*")
 
+# DB 모델
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String(200), nullable=False)
 
-# --- 비동기로 처리할 '무거운 작업' 정의 ---
+# 비동기 작업 정의
 @celery.task
 def heavy_processing_task(content):
-    print(f"[Worker] 데이터 '{content}' 분석 시작 (10초 소요)...")
+    print(f"[Worker] '{content}' 분석 중... (10초 소요)")
     time.sleep(10)
     print(f"[Worker] 분석 완료!")
     return True
 
+# DB 초기화 (연결 재시도 로직 포함)
 def init_db():
     retries = 10
     while retries > 0:
         try:
             with app.app_context():
                 db.create_all()
-            print("Successfully connected to the database!")
-            return
+            return True
         except OperationalError:
             retries -= 1
-            print(f"Waiting for database... ({10-retries}/10)")
             time.sleep(3)
-    print("Could not connect to the database. Exiting.")
+    return False
 
 init_db()
 
 @app.route('/')
 def index():
-    count = redis.incr('hits')
     messages = Message.query.all()
-    msg_list = "".join([f"<li>{m.content}</li>" for m in messages])
-    
-    # [마이크로서비스 통신] 통계 서비스에게 데이터 요청
+    # 마이크로서비스(stats-service)에서 통계 가져오기
     try:
-        # 도커 네트워크 안에서는 서비스 이름이 곧 주소입니다.
-        response = requests.get("http://stats-service:5001/stats", timeout=2)
-        total_msgs = response.json().get('total_messages', 0)
+        resp = requests.get("http://stats-service:5001/stats", timeout=2)
+        total_count = resp.json().get('total_messages', 0)
     except:
-        total_msgs = "통계 서비스 연결 불가"
+        total_count = "연결 불가"
 
     return f"""
-    <h1>🏢 마이크로서비스 시스템</h1>
-    <p><b>총 방문자:</b> {count} | <b>총 저장된 메시지:</b> {total_msgs}</p>
+    <h1>⚡ 실시간 풀스택 시스템</h1>
+    <p><b>총 메시지 수(MSA 통계):</b> <span id="total-count">{total_count}</span></p>
     <hr>
-    <ul>{msg_list}</ul>
-    <h1>🚀 비동기 작업 큐 통합 시스템</h1>
-    <p><b>방문자 수:</b> {count}</p>
-    <hr>
-    <h3>방명록 (DB 저장)</h3>
-    <ul>{msg_list if msg_list else "아직 메시지가 없습니다."}</ul>
-    <form action="/add" method="post">
-        <input type="text" name="content" placeholder="방명록 남기기" required>
-        <button type="submit">저장 및 비동기 작업 요청</button>
-    </form>
-    <p><i>* 글을 남기면 DB에 즉시 저장되고, 10초짜리 분석 작업이 백그라운드에서 시작됩니다.</i></p>
+    <ul id="msg-list">{"".join([f"<li>{m.content}</li>" for m in messages])}</ul>
+    <input type="text" id="input-msg" placeholder="내용 입력">
+    <button onclick="send()">실시간 전송</button>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script>
+        var socket = io();
+        socket.on('new_message', function(data) {{
+            var li = document.createElement("li");
+            li.textContent = data.content;
+            document.getElementById("msg-list").appendChild(li);
+        }});
+        function send() {{
+            var val = document.getElementById("input-msg").value;
+            socket.emit('submit_message', {{content: val}});
+            document.getElementById("input-msg").value = "";
+        }}
+    </script>
     """
 
-@app.route('/add', methods=['POST'])
-def add_message():
-    content = request.form.get('content')
+@socketio.on('submit_message')
+def handle_msg(data):
+    content = data.get('content')
     if content:
-        # 1. 즉시 처리: DB 저장
+        # 1. DB 저장
         new_msg = Message(content=content)
         db.session.add(new_msg)
         db.session.commit()
-        
-        # 2. 비동기 처리: 일꾼(Worker)에게 무거운 작업 던지기
-        heavy_processing_task.delay(content) # .delay()가 핵심!
-        
-    return f"<script>alert('DB 저장 완료! 무거운 작업은 일꾼이 시작했습니다.'); window.location.href='/';</script>"
+        # 2. 비동기 작업 요청 (일꾼에게)
+        heavy_processing_task.delay(content)
+        # 3. 실시간 브로드캐스트 (모든 유저에게)
+        emit('new_message', {'content': content}, broadcast=True)
 
 @app.route('/health')
-def health_check():
-    try:
-        db.session.execute('SELECT 1')
-        redis.ping()
-        return jsonify(status="healthy"), 200
-    except Exception as e:
-        return jsonify(status="unhealthy", reason=str(e)), 500
+def health():
+    return jsonify(status="healthy"), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
