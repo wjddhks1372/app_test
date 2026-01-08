@@ -1,10 +1,12 @@
 import os
 import time
+import requests
 from flask import Flask, request, jsonify
 from redis import Redis
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import OperationalError
 from celery import Celery # 추가
+
 
 app = Flask(__name__)
 
@@ -55,7 +57,19 @@ def index():
     messages = Message.query.all()
     msg_list = "".join([f"<li>{m.content}</li>" for m in messages])
     
+    # [마이크로서비스 통신] 통계 서비스에게 데이터 요청
+    try:
+        # 도커 네트워크 안에서는 서비스 이름이 곧 주소입니다.
+        response = requests.get("http://stats-service:5001/stats", timeout=2)
+        total_msgs = response.json().get('total_messages', 0)
+    except:
+        total_msgs = "통계 서비스 연결 불가"
+
     return f"""
+    <h1>🏢 마이크로서비스 시스템</h1>
+    <p><b>총 방문자:</b> {count} | <b>총 저장된 메시지:</b> {total_msgs}</p>
+    <hr>
+    <ul>{msg_list}</ul>
     <h1>🚀 비동기 작업 큐 통합 시스템</h1>
     <p><b>방문자 수:</b> {count}</p>
     <hr>

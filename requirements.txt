@@ -3,3 +3,4 @@ redis
 flask-sqlalchemy
 psycopg2-binary
 celery
+requests
