@@ -1,10 +1,11 @@
 import eventlet
-eventlet.monkey_patch()
+eventlet.monkey_patch()  # 반드시 최상단!
 
 import os
 import time
 import requests
 from flask import Flask, request, jsonify
+from redis import Redis  # 방문자 수를 위해 다시 추가
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit
 from celery import Celery
@@ -18,13 +19,16 @@ redis_host = os.environ.get('REDIS_HOST', 'redis')
 db_url = os.environ.get('DATABASE_URL', 'postgresql://user:password@db:5432/myapp')
 
 # 서비스 초기화
-# 1. DB & Redis
+# 1. DB & Redis (방문자 수용)
 app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
-# 2. Celery (비동기 일꾼용 우체국)
+redis_client = Redis(host=redis_host, port=6379, decode_responses=True)
+
+# 2. Celery (비동기 일꾼)
 celery = Celery(app.name, broker=f'redis://{redis_host}:6379/0', backend=f'redis://{redis_host}:6379/0')
-# 3. SocketIO (실시간 통신용)
+
+# 3. SocketIO (실시간 통신)
 socketio = SocketIO(app, message_queue=f'redis://{redis_host}:6379/0', cors_allowed_origins="*")
 
 # DB 모델
@@ -40,7 +44,6 @@ def heavy_processing_task(content):
     print(f"[Worker] 분석 완료!")
     return True
 
-# DB 초기화 (연결 재시도 로직 포함)
 def init_db():
     retries = 10
     while retries > 0:
@@ -57,34 +60,47 @@ init_db()
 
 @app.route('/')
 def index():
+    # 1. Redis에서 방문자 수 가져오기 (복구된 로직)
+    count = redis_client.incr('hits')
+    
+    # 2. DB에서 메시지 목록 가져오기
     messages = Message.query.all()
-    # 마이크로서비스(stats-service)에서 통계 가져오기
+    
+    # 3. MSA(stats-service)에서 통계 가져오기
     try:
         resp = requests.get("http://stats-service:5001/stats", timeout=2)
-        total_count = resp.json().get('total_messages', 0)
+        total_msg_count = resp.json().get('total_messages', 0)
     except:
-        total_count = "연결 불가"
+        total_msg_count = "연결 불가"
 
     return f"""
-    <h1>⚡ 실시간 풀스택 시스템</h1>
-    <p><b>총 메시지 수(MSA 통계):</b> <span id="total-count">{total_count}</span></p>
+    <h1>⚡ 통합 실시간 풀스택 시스템</h1>
+    <p><b>방문자 수 (Redis):</b> {count}</p>
+    <p><b>총 메시지 수 (MSA 통계):</b> <span id="total-count">{total_msg_count}</span></p>
     <hr>
+    <h3>실시간 방명록</h3>
     <ul id="msg-list">{"".join([f"<li>{m.content}</li>" for m in messages])}</ul>
-    <input type="text" id="input-msg" placeholder="내용 입력">
+    <hr>
+    <input type="text" id="input-msg" placeholder="내용 입력" style="width: 300px;">
     <button onclick="send()">실시간 전송</button>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script>
         var socket = io();
+        
+        // 서버에서 새 메시지 신호를 받으면 리스트에 추가
         socket.on('new_message', function(data) {{
             var li = document.createElement("li");
             li.textContent = data.content;
             document.getElementById("msg-list").appendChild(li);
         }});
+
         function send() {{
             var val = document.getElementById("input-msg").value;
-            socket.emit('submit_message', {{content: val}});
-            document.getElementById("input-msg").value = "";
+            if(val) {{
+                socket.emit('submit_message', {{content: val}});
+                document.getElementById("input-msg").value = "";
+            }}
         }}
     </script>
     """
@@ -97,9 +113,11 @@ def handle_msg(data):
         new_msg = Message(content=content)
         db.session.add(new_msg)
         db.session.commit()
-        # 2. 비동기 작업 요청 (일꾼에게)
+        
+        # 2. 비동기 작업 요청 (Celery)
         heavy_processing_task.delay(content)
-        # 3. 실시간 브로드캐스트 (모든 유저에게)
+        
+        # 3. 모든 클라이언트에게 실시간 뿌리기 (Socket.IO)
         emit('new_message', {'content': content}, broadcast=True)
 
 @app.route('/health')
